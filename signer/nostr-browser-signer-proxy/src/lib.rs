@@ -21,27 +21,28 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use atomic_destructor::{AtomicDestroyer, AtomicDestructor};
 use bytes::Bytes;
+use event_listener::Event as ShutdownEvent;
+use futures::channel::oneshot::{self, Sender};
+use futures::lock::Mutex;
+use futures::{FutureExt, pin_mut, select_biased};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
 use nostr::prelude::*;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Value, json};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot::Sender;
-use tokio::sync::{Mutex, Notify, oneshot};
-use tokio::time;
 use uuid::Uuid;
 
 mod error;
 pub mod prelude;
+mod rt;
 
 pub use self::error::Error;
+pub use self::rt::Runtime;
 
 const DEFAULT_HTML: &str = include_str!("../index.html");
 const JS: &str = include_str!("../proxy.js");
@@ -172,26 +173,28 @@ pub struct BrowserSignerProxyOptions {
 }
 
 #[derive(Debug, Clone)]
-struct InnerBrowserSignerProxy {
+struct InnerBrowserSignerProxy<R: rt::Runtime> {
     /// Configuration options for the proxy
     options: BrowserSignerProxyOptions,
     /// Internal state of the proxy including request queues
     state: Arc<ProxyState>,
-    /// Notification trigger for graceful shutdown
-    shutdown: Arc<Notify>,
+    /// Event for graceful shutdown notification
+    shutdown: Arc<ShutdownEvent>,
     /// Flag to indicate if the server is shutdown
     is_shutdown: Arc<AtomicBool>,
     /// Flat indicating if the server is started
     is_started: Arc<AtomicBool>,
+    /// The runtime instance, stored after binding
+    runtime: Arc<std::sync::Mutex<Option<R>>>,
 }
 
-impl AtomicDestroyer for InnerBrowserSignerProxy {
+impl<R: rt::Runtime> AtomicDestroyer for InnerBrowserSignerProxy<R> {
     fn on_destroy(&self) {
         self.shutdown();
     }
 }
 
-impl InnerBrowserSignerProxy {
+impl<R: rt::Runtime> InnerBrowserSignerProxy<R> {
     #[inline]
     fn is_shutdown(&self) -> bool {
         self.is_shutdown.load(Ordering::SeqCst)
@@ -202,17 +205,29 @@ impl InnerBrowserSignerProxy {
         self.is_shutdown.store(true, Ordering::SeqCst);
 
         // Notify all waiters that the proxy is shutting down
-        self.shutdown.notify_one();
-        self.shutdown.notify_waiters();
+        self.shutdown.notify(usize::MAX);
     }
+}
+
+// Default runtime type: Tokio when feature is enabled, NoRuntime otherwise
+#[cfg(feature = "tokio")]
+mod default_rt {
+    pub use crate::rt::TokioRuntime as DefaultRuntime;
+}
+#[cfg(not(feature = "tokio"))]
+mod default_rt {
+    pub use crate::rt::NoRuntime as DefaultRuntime;
 }
 
 /// Nostr Browser Signer Proxy
 ///
 /// Proxy to use Nostr Browser signer (NIP-07) in native applications.
+///
+/// The type parameter `R` selects the async runtime.
+/// With the default `tokio` feature, this defaults to [`TokioRuntime`](crate::rt::TokioRuntime).
 #[derive(Debug, Clone)]
-pub struct BrowserSignerProxy {
-    inner: AtomicDestructor<InnerBrowserSignerProxy>,
+pub struct BrowserSignerProxy<R: rt::Runtime = default_rt::DefaultRuntime> {
+    inner: AtomicDestructor<InnerBrowserSignerProxy<R>>,
 }
 
 impl Default for BrowserSignerProxyOptions {
@@ -256,7 +271,7 @@ impl BrowserSignerProxyOptions {
     }
 }
 
-impl BrowserSignerProxy {
+impl<R: rt::Runtime> BrowserSignerProxy<R> {
     /// Construct a new browser signer proxy
     pub fn new(options: BrowserSignerProxyOptions) -> Self {
         let state = ProxyState {
@@ -269,9 +284,10 @@ impl BrowserSignerProxy {
             inner: AtomicDestructor::new(InnerBrowserSignerProxy {
                 options,
                 state: Arc::new(state),
-                shutdown: Arc::new(Notify::new()),
+                shutdown: Arc::new(ShutdownEvent::new()),
                 is_shutdown: Arc::new(AtomicBool::new(false)),
                 is_started: Arc::new(AtomicBool::new(false)),
+                runtime: Arc::new(std::sync::Mutex::new(None)),
             }),
         }
     }
@@ -312,8 +328,8 @@ impl BrowserSignerProxy {
             return Ok(());
         }
 
-        let listener: TcpListener = match TcpListener::bind(self.inner.options.addr).await {
-            Ok(listener) => listener,
+        let runtime: R = match R::bind(self.inner.options.addr).await {
+            Ok(runtime) => runtime,
             Err(e) => {
                 // Undo the started flag if binding fails
                 self.inner.is_started.store(false, Ordering::SeqCst);
@@ -323,47 +339,65 @@ impl BrowserSignerProxy {
             }
         };
 
+        // Store runtime for later use (e.g., in request timeout)
+        *self.inner.runtime.lock().unwrap() = Some(runtime.clone());
+
         let addr: SocketAddr = self.inner.options.addr;
         let state: Arc<ProxyState> = self.inner.state.clone();
         let custom_html = self.inner.options.custom_html;
-        let shutdown: Arc<Notify> = self.inner.shutdown.clone();
+        let shutdown_evt: Arc<ShutdownEvent> = self.inner.shutdown.clone();
+        let is_shutdown: Arc<AtomicBool> = self.inner.is_shutdown.clone();
 
-        tokio::spawn(async move {
+        runtime.clone().spawn(async move {
             tracing::info!("Starting proxy server on {addr}");
 
             loop {
-                tokio::select! {
-                    res = listener.accept() => {
-                        let stream: TcpStream = match res {
-                            Ok((stream, ..)) => stream,
+                if is_shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                let accept_fut = runtime.accept().fuse();
+                pin_mut!(accept_fut);
+                let shutdown_listener = shutdown_evt.listen().fuse();
+                pin_mut!(shutdown_listener);
+
+                select_biased! {
+                    res = accept_fut => {
+                        let (io, _) = match res {
+                            Ok(ok) => ok,
                             Err(e) => {
                                 tracing::error!("Failed to accept connection: {}", e);
                                 continue;
                             }
                         };
 
-                        let io: TokioIo<TcpStream> = TokioIo::new(stream);
-                        let state: Arc<ProxyState> = state.clone();
-                        let shutdown: Arc<Notify> = shutdown.clone();
+                        let state = state.clone();
+                        let shutdown_evt = shutdown_evt.clone();
+                        let rt = runtime.clone();
 
-                        tokio::spawn(async move {
+                        rt.spawn(async move {
                             let service = service_fn(move |req| {
                                 handle_request(req, state.clone(), custom_html)
                             });
 
-                            tokio::select! {
-                                res = http1::Builder::new().serve_connection(io, service) => {
+                            let serve_fut = http1::Builder::new().serve_connection(io, service).fuse();
+                            pin_mut!(serve_fut);
+                            let shutdown_listener = shutdown_evt.listen().fuse();
+                            pin_mut!(shutdown_listener);
+
+                            select_biased! {
+                                res = serve_fut => {
                                     if let Err(e) = res {
                                         tracing::error!("Error serving connection: {e}");
                                     }
                                 }
-                                _ = shutdown.notified() => {
-                                        tracing::debug!("Closing connection, proxy server is shutting down.");
-                                    }
+                                _ = shutdown_listener => {
+                                    tracing::debug!("Closing connection, proxy server is shutting down.");
                                 }
+                            }
                         });
                     },
-                    _ = shutdown.notified() => {
+                    _ = shutdown_listener => {
                         break;
                     }
                 }
@@ -406,13 +440,27 @@ impl BrowserSignerProxy {
         // Add to outgoing requests queue
         self.store_outgoing_request(request).await;
 
-        // Wait for response
-        match time::timeout(self.inner.options.timeout, rx)
-            .await
-            .map_err(|_| Error::timeout())??
-        {
-            Ok(res) => Ok(serde_json::from_value(res)?),
-            Err(error) => Err(Error::generic(error)),
+        // Get the runtime for timeout
+        let _runtime = self
+            .inner
+            .runtime
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| Error::generic("runtime not initialized"))?;
+
+        // Race the response against timeout
+        let sleep = R::sleep(self.inner.options.timeout);
+        pin_mut!(sleep);
+        pin_mut!(rx);
+
+        match futures::future::select(rx, sleep).await {
+            futures::future::Either::Left((res, _sleep)) => match res {
+                Ok(Ok(val)) => Ok(serde_json::from_value(val)?),
+                Ok(Err(err)) => Err(Error::generic(err)),
+                Err(_) => Err(Error::generic("sender dropped")),
+            },
+            futures::future::Either::Right(((), _rx)) => Err(Error::timeout()),
         }
     }
 
@@ -459,7 +507,7 @@ impl BrowserSignerProxy {
     }
 }
 
-impl AsyncGetPublicKey for BrowserSignerProxy {
+impl<R: rt::Runtime> AsyncGetPublicKey for BrowserSignerProxy<R> {
     type Error = Error;
 
     #[inline]
@@ -470,7 +518,7 @@ impl AsyncGetPublicKey for BrowserSignerProxy {
     }
 }
 
-impl AsyncSignEvent for BrowserSignerProxy {
+impl<R: rt::Runtime> AsyncSignEvent for BrowserSignerProxy<R> {
     type Error = Error;
 
     #[inline]
@@ -482,7 +530,7 @@ impl AsyncSignEvent for BrowserSignerProxy {
     }
 }
 
-impl AsyncNip04 for BrowserSignerProxy {
+impl<R: rt::Runtime> AsyncNip04 for BrowserSignerProxy<R> {
     type Error = Error;
 
     fn nip04_encrypt_async<'a>(
@@ -502,7 +550,7 @@ impl AsyncNip04 for BrowserSignerProxy {
     }
 }
 
-impl AsyncNip44 for BrowserSignerProxy {
+impl<R: rt::Runtime> AsyncNip44 for BrowserSignerProxy<R> {
     type Error = Error;
 
     fn nip44_encrypt_async<'a>(

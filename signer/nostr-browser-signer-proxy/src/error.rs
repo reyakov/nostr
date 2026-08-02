@@ -4,8 +4,8 @@
 
 //! Error
 
+use futures::channel::oneshot::Canceled;
 use hyper::http;
-use tokio::sync::oneshot::error::RecvError;
 
 opaquerr::define_kind! {
     /// Nostr browser signer proxy error kind.
@@ -36,7 +36,7 @@ opaquerr::define_error! {
         std::io::Error => ErrorKind::IO,
         http::Error => ErrorKind::Http,
         serde_json::Error => ErrorKind::Json,
-        RecvError => ErrorKind::Other,
+        Canceled => ErrorKind::Other,
     }
 }
 
